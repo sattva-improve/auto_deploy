@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2024-12-29
+
+### Added
+
+#### サンプルプロジェクト: タスク管理API
+
+全4フェーズを実行し、完全なAPI仕様書を生成しました。
+
+**Phase 1: 要件定義** (`requirements/projects/task-management-api/`)
+- 機能要件15項目（ユーザー認証、プロジェクト管理、タスク管理、コメント機能）
+- 非機能要件（性能、可用性、セキュリティ）
+- データエンティティとER図
+- API要件概要
+
+**Phase 2: 基本設計** (`design/basic/projects/task-management-api/`)
+- システムアーキテクチャ図
+- API設計方針とURL設計規則
+- 21エンドポイント設計
+- データモデル設計（ER図）
+- JWT認証・RBAC認可設計
+- エラーコード設計
+
+**Phase 3: 詳細設計** (`design/detailed/projects/task-management-api/`)
+- 全エンドポイントの詳細仕様
+- リクエスト/レスポンススキーマ定義
+- バリデーションルール詳細
+- 処理フロー図（シーケンス図）
+- データベースDDL（PostgreSQL）
+
+**Phase 4: OpenAPI仕様書** (`specs/openapi/projects/task-management-api/`)
+- OpenAPI 3.1準拠の完全な仕様書
+- 21エンドポイント、認証・エラー定義を含む
+
+---
+
 ## [1.0.0] - 2024-12-29
 
 ### Added
