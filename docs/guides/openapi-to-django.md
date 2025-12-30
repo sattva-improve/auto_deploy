@@ -1,5 +1,9 @@
 # OpenAPI → Django REST Framework 変換ガイド
 
+> **ドキュメントバージョン**: 1.1.0  
+> **最終更新日**: 2025-12-30  
+> **ステータス**: Active
+
 OpenAPI仕様書からDjango + Django REST Framework (DRF) を使用したAPIを実装するためのガイドです。
 
 ## 目次
@@ -9,10 +13,44 @@ OpenAPI仕様書からDjango + Django REST Framework (DRF) を使用したAPIを
 3. [OpenAPI → Django マッピング](#openapi--django-マッピング)
 4. [実装手順](#実装手順)
 5. [コード変換パターン](#コード変換パターン)
+6. [チェックリスト](#チェックリスト)
+7. [関連ドキュメント](#関連ドキュメント)
 
 ---
 
 ## プロジェクト構成
+
+### ディレクトリ構造
+
+```mermaid
+flowchart TB
+    subgraph Backend["backend/"]
+        Config["config/<br>Django設定"]
+        API["api/<br>APIアプリ"]
+        Manage["manage.py"]
+        Pytest["pytest.ini"]
+    end
+    
+    subgraph ConfigFiles["config/"]
+        Settings["settings.py"]
+        Urls["urls.py"]
+        Wsgi["wsgi.py"]
+    end
+    
+    subgraph APIFiles["api/"]
+        Models["models.py"]
+        Serializers["serializers.py"]
+        Views["views.py"]
+        APIUrls["urls.py"]
+        Pagination["pagination.py"]
+        Permissions["permissions.py"]
+        Exceptions["exceptions.py"]
+        Tests["tests/"]
+    end
+    
+    Config --> ConfigFiles
+    API --> APIFiles
+```
 
 ```
 backend/
@@ -463,3 +501,29 @@ def custom_exception_handler(exc, context):
 - [ ] ページネーションが仕様通りか
 - [ ] フィールド名のcamelCase/snake_case変換が正しいか
 - [ ] テストが全エンドポイントをカバーしているか
+
+---
+
+## 関連ドキュメント
+
+| ドキュメント | パス | 説明 |
+|-------------|------|------|
+| システム概要 | [../overview.md](../overview.md) | システム全体の概要 |
+| ガイドインデックス | [index.md](./index.md) | ガイド一覧 |
+| Django変換テンプレート集 | [openapi-to-django-templates.md](./openapi-to-django-templates.md) | コードテンプレート |
+| AWS ECSデプロイガイド | [aws-ecs-deployment.md](./aws-ecs-deployment.md) | デプロイ手順 |
+
+---
+
+## 変更履歴
+
+| バージョン | 日付 | 変更内容 |
+|-----------|------|----------|
+| 1.1.0 | 2025-12-30 | mermaid図の追加、関連ドキュメントセクション追加 |
+| 1.0.0 | 2024-12-29 | 初版作成 |
+
+---
+
+**作成日**: 2024-12-29  
+**最終更新日**: 2025-12-30  
+**メンテナー**: auto_deploy プロジェクトチーム
