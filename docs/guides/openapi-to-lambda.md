@@ -1,10 +1,12 @@
 # OpenAPI → AWS Lambda 変換ガイド
 
-> **ドキュメントバージョン**: 1.0.0  
+> **ドキュメントバージョン**: 1.1.0  
 > **最終更新日**: 2025-12-30  
 > **ステータス**: Active
 
 OpenAPI仕様書からAWS Lambda + API Gatewayを使用したサーバーレスAPIを実装するためのガイドです。
+
+> **認証方式**: Amazon Cognitoを使用したJWT認証
 
 ## 目次
 
@@ -86,18 +88,19 @@ lambda/
 ## 依存パッケージ
 
 ```bash
-pip install aws-lambda-powertools pydantic boto3 python-jose passlib pytest pytest-mock moto
+pip install aws-lambda-powertools pydantic boto3 python-jose pytest pytest-mock moto
 ```
 
 | パッケージ | 用途 |
 |-----------|------|
 | aws-lambda-powertools | Lambda開発ユーティリティ（ロギング、トレーシング、バリデーション） |
 | pydantic | データバリデーション・シリアライゼーション |
-| boto3 | AWSサービス操作（DynamoDB等） |
-| python-jose | JWT認証 |
-| passlib | パスワードハッシュ |
+| boto3 | AWSサービス操作（DynamoDB、Cognito等） |
+| python-jose | Cognito JWT トークン検証 |
 | pytest | テスト |
 | moto | AWSサービスモック |
+
+> **Note**: 認証にはAmazon Cognitoを使用します。ユーザー管理（サインアップ、サインイン、パスワードリセット等）はCognitoが担当するため、`passlib`等のパスワードハッシュライブラリは不要です。
 
 ### requirements.txt
 
@@ -106,7 +109,6 @@ aws-lambda-powertools>=2.0.0
 pydantic>=2.0.0
 boto3>=1.28.0
 python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
 ```
 
 ---
@@ -427,47 +429,146 @@ class DynamoDBRepository:
         return item
 ```
 
-### パターン4: JWT認証 → Lambda Authorizer
+### パターン4: Amazon Cognito 認証
 
-**Lambda Authorizer:**
-```python
-from jose import jwt, JWTError
-import os
+#### 認証フロー
 
-JWT_SECRET = os.environ["JWT_SECRET"]
-JWT_ALGORITHM = "HS256"
-
-
-def authorizer_handler(event: dict, context) -> dict:
-    """API Gateway Lambda Authorizer"""
-    token = event.get("authorizationToken", "").replace("Bearer ", "")
-    method_arn = event["methodArn"]
+```mermaid
+sequenceDiagram
+    participant Client as クライアント
+    participant Cognito as Amazon Cognito
+    participant APIGW as API Gateway
+    participant Lambda as Lambda
     
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id = payload.get("sub")
-        
-        return generate_policy(user_id, "Allow", method_arn, {
-            "user_id": user_id,
-            "email": payload.get("email")
-        })
-    except JWTError:
-        return generate_policy("anonymous", "Deny", method_arn)
+    Client->>Cognito: サインアップ/サインイン
+    Cognito-->>Client: JWT トークン (ID/Access/Refresh)
+    Client->>APIGW: API リクエスト + Authorization: Bearer <token>
+    APIGW->>APIGW: Cognito Authorizer でトークン検証
+    APIGW->>Lambda: 認証済みリクエスト + ユーザー情報
+    Lambda-->>Client: レスポンス
+```
 
+#### Cognito User Pool の設定（SAMテンプレート）
 
-def generate_policy(principal_id: str, effect: str, resource: str, context: dict = None) -> dict:
+```yaml
+Resources:
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-user-pool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: false
+          Mutable: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-client
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+```
+
+#### API Gateway Cognito Authorizer
+
+```yaml
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+```
+
+#### Lambda ハンドラーでのユーザー情報取得
+
+```python
+def get_user_from_event(event: dict) -> dict:
+    """Cognito認証情報からユーザー情報を取得"""
+    claims = event.get("requestContext", {}).get("authorizer", {}).get("claims", {})
+    
     return {
-        "principalId": principal_id,
-        "policyDocument": {
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Action": "execute-api:Invoke",
-                "Effect": effect,
-                "Resource": resource
-            }]
-        },
-        "context": context or {}
+        "user_id": claims.get("sub"),
+        "email": claims.get("email"),
+        "name": claims.get("name", ""),
+        "email_verified": claims.get("email_verified") == "true",
     }
+
+
+@app.get("/projects")
+def list_projects():
+    user = get_user_from_event(app.current_event.raw_event)
+    # user["user_id"] でユーザー識別
+    projects = project_service.list_by_user(user["user_id"])
+    return {"data": projects}
+```
+
+#### クライアント側の認証実装例（Python）
+
+```python
+import boto3
+
+cognito = boto3.client("cognito-idp")
+
+# サインアップ
+def sign_up(email: str, password: str, name: str, client_id: str):
+    return cognito.sign_up(
+        ClientId=client_id,
+        Username=email,
+        Password=password,
+        UserAttributes=[
+            {"Name": "email", "Value": email},
+            {"Name": "name", "Value": name},
+        ],
+    )
+
+# サインイン
+def sign_in(email: str, password: str, client_id: str):
+    response = cognito.initiate_auth(
+        ClientId=client_id,
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={
+            "USERNAME": email,
+            "PASSWORD": password,
+        },
+    )
+    return {
+        "access_token": response["AuthenticationResult"]["AccessToken"],
+        "id_token": response["AuthenticationResult"]["IdToken"],
+        "refresh_token": response["AuthenticationResult"]["RefreshToken"],
+    }
+
+# トークンリフレッシュ
+def refresh_token(refresh_token: str, client_id: str):
+    response = cognito.initiate_auth(
+        ClientId=client_id,
+        AuthFlow="REFRESH_TOKEN_AUTH",
+        AuthParameters={
+            "REFRESH_TOKEN": refresh_token,
+        },
+    )
+    return response["AuthenticationResult"]
 ```
 
 ### パターン5: エラーハンドリング

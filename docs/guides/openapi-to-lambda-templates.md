@@ -1,10 +1,12 @@
 # OpenAPI→Lambda テンプレートガイド
 
-> **ドキュメントバージョン**: 1.0.0  
+> **ドキュメントバージョン**: 1.1.0  
 > **最終更新日**: 2025-12-30  
 > **ステータス**: Active
 
 このドキュメントでは、OpenAPI仕様からAWS Lambda関数を実装する際に使用するコードテンプレートを提供します。
+
+> **認証方式**: Amazon Cognitoを使用したJWT認証
 
 ## 目次
 
@@ -12,7 +14,7 @@
 2. [Pydanticモデル](#pydanticモデル)
 3. [Lambdaハンドラー](#lambdaハンドラー)
 4. [DynamoDBリポジトリ](#dynamodbリポジトリ)
-5. [認証・認可](#認証認可)
+5. [認証・認可（Amazon Cognito）](#認証認可amazon-cognito)
 6. [エラーハンドリング](#エラーハンドリング)
 7. [ユーティリティ](#ユーティリティ)
 8. [テスト](#テスト)
@@ -32,13 +34,14 @@ templates/
 │   └── response_model.py    # レスポンスモデル
 ├── handlers/
 │   ├── base_handler.py      # 基本ハンドラー
-│   └── crud_handler.py      # CRUDハンドラー
+│   ├── crud_handler.py      # CRUDハンドラー
+│   └── auth_handler.py      # 認証ハンドラー
 ├── repositories/
 │   ├── base_repository.py   # 基本リポジトリ
 │   └── dynamodb_repository.py
 ├── auth/
-│   ├── jwt_handler.py       # JWT処理
-│   └── authorizer.py        # Lambda Authorizer
+│   ├── cognito_helper.py    # Cognito操作ヘルパー
+│   └── user_context.py      # ユーザーコンテキスト
 ├── shared/
 │   ├── exceptions.py        # カスタム例外
 │   ├── responses.py         # レスポンスヘルパー
@@ -784,155 +787,407 @@ class ProjectRepository(BaseRepository[Project]):
 
 ---
 
-## 認証・認可
+## 認証・認可（Amazon Cognito）
 
-### JWT処理（jwt_handler.py）
+> **Note**: 認証にはAmazon Cognitoを使用します。API Gateway の Cognito Authorizer により、トークン検証が自動的に行われます。
 
-```python
-"""JWT処理"""
-import os
-import jwt
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+### アーキテクチャ
 
-from shared.exceptions import AuthenticationError
-
-
-class JWTHandler:
-    """JWT処理クラス"""
+```mermaid
+flowchart LR
+    subgraph Client["クライアント"]
+        App[アプリケーション]
+    end
     
-    def __init__(self):
-        self.secret = os.environ.get("JWT_SECRET")
-        self.algorithm = "HS256"
-        self.access_token_expire = timedelta(hours=1)
-        self.refresh_token_expire = timedelta(days=7)
+    subgraph AWS["AWS"]
+        Cognito[Amazon Cognito<br>User Pool]
+        APIGW[API Gateway<br>+ Cognito Authorizer]
+        Lambda[Lambda Functions]
+    end
     
-    def create_access_token(self, payload: Dict[str, Any]) -> str:
-        """アクセストークンを生成"""
-        
-        expire = datetime.utcnow() + self.access_token_expire
-        token_data = {
-            **payload,
-            "exp": expire,
-            "type": "access",
-        }
-        return jwt.encode(token_data, self.secret, algorithm=self.algorithm)
-    
-    def create_refresh_token(self, payload: Dict[str, Any]) -> str:
-        """リフレッシュトークンを生成"""
-        
-        expire = datetime.utcnow() + self.refresh_token_expire
-        token_data = {
-            **payload,
-            "exp": expire,
-            "type": "refresh",
-        }
-        return jwt.encode(token_data, self.secret, algorithm=self.algorithm)
-    
-    def verify_token(self, token: str) -> Dict[str, Any]:
-        """トークンを検証"""
-        
-        try:
-            payload = jwt.decode(
-                token,
-                self.secret,
-                algorithms=[self.algorithm],
-            )
-            return payload
-        except jwt.ExpiredSignatureError:
-            raise AuthenticationError("トークンの有効期限が切れています")
-        except jwt.InvalidTokenError:
-            raise AuthenticationError("無効なトークンです")
-    
-    def create_tokens(self, user_id: str, email: str, role: str = "user") -> Dict[str, str]:
-        """アクセストークンとリフレッシュトークンを生成"""
-        
-        payload = {
-            "user_id": user_id,
-            "email": email,
-            "role": role,
-        }
-        
-        return {
-            "access_token": self.create_access_token(payload),
-            "refresh_token": self.create_refresh_token(payload),
-            "token_type": "Bearer",
-            "expires_in": int(self.access_token_expire.total_seconds()),
-        }
+    App -->|1. サインイン| Cognito
+    Cognito -->|2. JWT トークン| App
+    App -->|3. API リクエスト<br>+ Bearer Token| APIGW
+    APIGW -->|4. トークン検証| Cognito
+    APIGW -->|5. 認証済みリクエスト| Lambda
 ```
 
-### Lambda Authorizer（authorizer.py）
+### Cognito ヘルパー（cognito_helper.py）
 
 ```python
-"""Lambda Authorizer"""
+"""Amazon Cognito ヘルパー"""
 import os
+from typing import Dict, Any, Optional
+import boto3
+from botocore.exceptions import ClientError
 from aws_lambda_powertools import Logger
-from auth.jwt_handler import JWTHandler
+
+from shared.exceptions import AuthenticationError, ValidationError
 
 
 logger = Logger()
-jwt_handler = JWTHandler()
 
 
-def authorizer_handler(event: dict, context) -> dict:
-    """Lambda Authorizer ハンドラー"""
+class CognitoHelper:
+    """Cognito操作ヘルパークラス"""
     
-    logger.info("Authorizer invoked", extra={"event": event})
+    def __init__(self):
+        self.client = boto3.client("cognito-idp")
+        self.user_pool_id = os.environ.get("COGNITO_USER_POOL_ID")
+        self.client_id = os.environ.get("COGNITO_CLIENT_ID")
     
-    try:
-        # Authorizationヘッダーからトークンを取得
-        auth_header = event.get("authorizationToken", "")
+    def sign_up(self, email: str, password: str, name: str) -> Dict[str, Any]:
+        """ユーザー登録"""
         
-        if not auth_header.startswith("Bearer "):
-            logger.warning("Invalid authorization header format")
-            return generate_policy("user", "Deny", event["methodArn"])
+        try:
+            response = self.client.sign_up(
+                ClientId=self.client_id,
+                Username=email,
+                Password=password,
+                UserAttributes=[
+                    {"Name": "email", "Value": email},
+                    {"Name": "name", "Value": name},
+                ],
+            )
+            
+            return {
+                "user_id": response["UserSub"],
+                "email": email,
+                "confirmed": response["UserConfirmed"],
+            }
+        except self.client.exceptions.UsernameExistsException:
+            raise ValidationError("このメールアドレスは既に登録されています")
+        except self.client.exceptions.InvalidPasswordException as e:
+            raise ValidationError(f"パスワードが要件を満たしていません: {e}")
+        except ClientError as e:
+            logger.error(f"Sign up failed: {e}")
+            raise AuthenticationError("ユーザー登録に失敗しました")
+    
+    def confirm_sign_up(self, email: str, confirmation_code: str) -> bool:
+        """メール確認"""
         
-        token = auth_header.split(" ")[1]
+        try:
+            self.client.confirm_sign_up(
+                ClientId=self.client_id,
+                Username=email,
+                ConfirmationCode=confirmation_code,
+            )
+            return True
+        except self.client.exceptions.CodeMismatchException:
+            raise ValidationError("確認コードが正しくありません")
+        except self.client.exceptions.ExpiredCodeException:
+            raise ValidationError("確認コードの有効期限が切れています")
+        except ClientError as e:
+            logger.error(f"Confirm sign up failed: {e}")
+            raise AuthenticationError("メール確認に失敗しました")
+    
+    def sign_in(self, email: str, password: str) -> Dict[str, str]:
+        """サインイン"""
         
-        # トークン検証
-        payload = jwt_handler.verify_token(token)
+        try:
+            response = self.client.initiate_auth(
+                ClientId=self.client_id,
+                AuthFlow="USER_PASSWORD_AUTH",
+                AuthParameters={
+                    "USERNAME": email,
+                    "PASSWORD": password,
+                },
+            )
+            
+            auth_result = response["AuthenticationResult"]
+            return {
+                "access_token": auth_result["AccessToken"],
+                "id_token": auth_result["IdToken"],
+                "refresh_token": auth_result["RefreshToken"],
+                "expires_in": auth_result["ExpiresIn"],
+                "token_type": "Bearer",
+            }
+        except self.client.exceptions.NotAuthorizedException:
+            raise AuthenticationError("メールアドレスまたはパスワードが正しくありません")
+        except self.client.exceptions.UserNotConfirmedException:
+            raise AuthenticationError("メールアドレスが確認されていません")
+        except ClientError as e:
+            logger.error(f"Sign in failed: {e}")
+            raise AuthenticationError("サインインに失敗しました")
+    
+    def refresh_tokens(self, refresh_token: str) -> Dict[str, str]:
+        """トークンリフレッシュ"""
         
-        if payload.get("type") != "access":
-            logger.warning("Invalid token type")
-            return generate_policy("user", "Deny", event["methodArn"])
+        try:
+            response = self.client.initiate_auth(
+                ClientId=self.client_id,
+                AuthFlow="REFRESH_TOKEN_AUTH",
+                AuthParameters={
+                    "REFRESH_TOKEN": refresh_token,
+                },
+            )
+            
+            auth_result = response["AuthenticationResult"]
+            return {
+                "access_token": auth_result["AccessToken"],
+                "id_token": auth_result["IdToken"],
+                "expires_in": auth_result["ExpiresIn"],
+                "token_type": "Bearer",
+            }
+        except self.client.exceptions.NotAuthorizedException:
+            raise AuthenticationError("リフレッシュトークンが無効です")
+        except ClientError as e:
+            logger.error(f"Token refresh failed: {e}")
+            raise AuthenticationError("トークンの更新に失敗しました")
+    
+    def forgot_password(self, email: str) -> bool:
+        """パスワードリセット要求"""
         
-        # ポリシー生成
-        policy = generate_policy(
-            payload["user_id"],
-            "Allow",
-            event["methodArn"],
+        try:
+            self.client.forgot_password(
+                ClientId=self.client_id,
+                Username=email,
+            )
+            return True
+        except self.client.exceptions.UserNotFoundException:
+            # セキュリティのため、ユーザーが存在しなくても成功を返す
+            return True
+        except ClientError as e:
+            logger.error(f"Forgot password failed: {e}")
+            raise AuthenticationError("パスワードリセットの要求に失敗しました")
+    
+    def confirm_forgot_password(
+        self, email: str, confirmation_code: str, new_password: str
+    ) -> bool:
+        """パスワードリセット確認"""
+        
+        try:
+            self.client.confirm_forgot_password(
+                ClientId=self.client_id,
+                Username=email,
+                ConfirmationCode=confirmation_code,
+                Password=new_password,
+            )
+            return True
+        except self.client.exceptions.CodeMismatchException:
+            raise ValidationError("確認コードが正しくありません")
+        except self.client.exceptions.ExpiredCodeException:
+            raise ValidationError("確認コードの有効期限が切れています")
+        except self.client.exceptions.InvalidPasswordException as e:
+            raise ValidationError(f"パスワードが要件を満たしていません: {e}")
+        except ClientError as e:
+            logger.error(f"Confirm forgot password failed: {e}")
+            raise AuthenticationError("パスワードリセットに失敗しました")
+    
+    def get_user(self, access_token: str) -> Dict[str, Any]:
+        """ユーザー情報取得"""
+        
+        try:
+            response = self.client.get_user(AccessToken=access_token)
+            
+            attributes = {
+                attr["Name"]: attr["Value"]
+                for attr in response.get("UserAttributes", [])
+            }
+            
+            return {
+                "user_id": attributes.get("sub"),
+                "email": attributes.get("email"),
+                "name": attributes.get("name", ""),
+                "email_verified": attributes.get("email_verified") == "true",
+            }
+        except self.client.exceptions.NotAuthorizedException:
+            raise AuthenticationError("トークンが無効です")
+        except ClientError as e:
+            logger.error(f"Get user failed: {e}")
+            raise AuthenticationError("ユーザー情報の取得に失敗しました")
+    
+    def sign_out(self, access_token: str) -> bool:
+        """サインアウト（グローバル）"""
+        
+        try:
+            self.client.global_sign_out(AccessToken=access_token)
+            return True
+        except ClientError as e:
+            logger.error(f"Sign out failed: {e}")
+            return False
+```
+
+### 認証ハンドラー（auth_handler.py）
+
+```python
+"""認証ハンドラー"""
+from aws_lambda_powertools import Logger, Tracer
+from aws_lambda_powertools.event_handler import APIGatewayRestResolver
+from aws_lambda_powertools.utilities.typing import LambdaContext
+from pydantic import BaseModel, EmailStr, Field
+
+from auth.cognito_helper import CognitoHelper
+from shared.responses import success_response, error_response
+
+
+logger = Logger()
+tracer = Tracer()
+app = APIGatewayRestResolver()
+cognito = CognitoHelper()
+
+
+class SignUpRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8)
+    name: str = Field(min_length=1, max_length=100)
+
+
+class SignInRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class ConfirmSignUpRequest(BaseModel):
+    email: EmailStr
+    confirmation_code: str = Field(min_length=6, max_length=6)
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
+@app.post("/auth/signup")
+@tracer.capture_method
+def sign_up():
+    """ユーザー登録"""
+    body = app.current_event.json_body
+    request = SignUpRequest(**body)
+    
+    result = cognito.sign_up(
+        email=request.email,
+        password=request.password,
+        name=request.name,
+    )
+    
+    return success_response(
+        data=result,
+        message="確認メールを送信しました",
+        status_code=201,
+    )
+
+
+@app.post("/auth/signup/confirm")
+@tracer.capture_method
+def confirm_sign_up():
+    """メール確認"""
+    body = app.current_event.json_body
+    request = ConfirmSignUpRequest(**body)
+    
+    cognito.confirm_sign_up(
+        email=request.email,
+        confirmation_code=request.confirmation_code,
+    )
+    
+    return success_response(message="メールアドレスが確認されました")
+
+
+@app.post("/auth/signin")
+@tracer.capture_method
+def sign_in():
+    """サインイン"""
+    body = app.current_event.json_body
+    request = SignInRequest(**body)
+    
+    tokens = cognito.sign_in(
+        email=request.email,
+        password=request.password,
+    )
+    
+    return success_response(data=tokens)
+
+
+@app.post("/auth/refresh")
+@tracer.capture_method
+def refresh():
+    """トークンリフレッシュ"""
+    body = app.current_event.json_body
+    request = RefreshTokenRequest(**body)
+    
+    tokens = cognito.refresh_tokens(refresh_token=request.refresh_token)
+    
+    return success_response(data=tokens)
+
+
+@app.post("/auth/signout")
+@tracer.capture_method
+def sign_out():
+    """サインアウト"""
+    auth_header = app.current_event.get_header_value("Authorization") or ""
+    token = auth_header.replace("Bearer ", "")
+    
+    cognito.sign_out(access_token=token)
+    
+    return success_response(message="サインアウトしました")
+
+
+@logger.inject_lambda_context
+@tracer.capture_lambda_handler
+def lambda_handler(event: dict, context: LambdaContext) -> dict:
+    return app.resolve(event, context)
+```
+
+### リクエストからユーザー情報取得（user_context.py）
+
+```python
+"""ユーザーコンテキスト"""
+from typing import Dict, Any, Optional
+from dataclasses import dataclass
+
+
+@dataclass
+class UserContext:
+    """認証済みユーザー情報"""
+    
+    user_id: str
+    email: str
+    name: str = ""
+    email_verified: bool = False
+    
+    @classmethod
+    def from_event(cls, event: dict) -> Optional["UserContext"]:
+        """API Gatewayイベントからユーザー情報を取得
+        
+        Cognito Authorizer使用時、claimsに情報が含まれる
+        """
+        claims = (
+            event.get("requestContext", {})
+            .get("authorizer", {})
+            .get("claims", {})
         )
         
-        # コンテキストにユーザー情報を追加
-        policy["context"] = {
-            "user_id": payload["user_id"],
-            "email": payload.get("email", ""),
-            "role": payload.get("role", "user"),
-        }
+        if not claims:
+            return None
         
-        logger.info("Authorization successful", extra={"user_id": payload["user_id"]})
-        return policy
-        
-    except Exception as e:
-        logger.error(f"Authorization failed: {e}")
-        return generate_policy("user", "Deny", event["methodArn"])
+        return cls(
+            user_id=claims.get("sub", ""),
+            email=claims.get("email", ""),
+            name=claims.get("name", ""),
+            email_verified=claims.get("email_verified") == "true",
+        )
 
 
-def generate_policy(principal_id: str, effect: str, resource: str) -> dict:
-    """IAMポリシードキュメントを生成"""
+def get_user_id_from_event(event: dict) -> str:
+    """イベントからユーザーIDを取得"""
+    
+    user = UserContext.from_event(event)
+    if not user:
+        raise ValueError("認証情報が見つかりません")
+    return user.user_id
+
+
+def get_user_from_event(event: dict) -> Dict[str, Any]:
+    """イベントからユーザー情報を辞書で取得"""
+    
+    user = UserContext.from_event(event)
+    if not user:
+        return {}
     
     return {
-        "principalId": principal_id,
-        "policyDocument": {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Action": "execute-api:Invoke",
-                    "Effect": effect,
-                    "Resource": resource,
-                }
-            ],
-        },
+        "user_id": user.user_id,
+        "email": user.email,
+        "name": user.name,
+        "email_verified": user.email_verified,
     }
 ```
 

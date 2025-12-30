@@ -1,10 +1,12 @@
 # AWS API Gateway + Lambda デプロイガイド
 
-> **ドキュメントバージョン**: 1.0.0  
+> **ドキュメントバージョン**: 1.1.0  
 > **最終更新日**: 2025-12-30  
 > **ステータス**: Active
 
 AWS SAM (Serverless Application Model) を使用して、サーバーレスAPIをAPI Gateway + Lambdaにデプロイするためのガイドです。
+
+> **認証方式**: Amazon Cognitoを使用したJWT認証
 
 ## 目次
 
@@ -82,13 +84,17 @@ flowchart TB
     end
     
     subgraph AWS["☁️ AWS Cloud"]
+        subgraph Auth["認証"]
+            Cognito[Amazon Cognito<br>User Pool]
+        end
+        
         subgraph APIGW["API Gateway"]
             REST[REST API<br>/api/v1/*]
-            Auth[Lambda Authorizer]
+            CogAuth[Cognito Authorizer]
         end
         
         subgraph Lambda["Lambda Functions"]
-            L1[AuthFunction]
+            L1[AuthFunction<br>Cognito操作]
             L2[ProjectsFunction]
             L3[TasksFunction]
             L4[CommentsFunction]
@@ -101,13 +107,16 @@ flowchart TB
         CW[CloudWatch<br>Logs]
     end
     
-    User -->|HTTPS| REST
-    REST --> Auth
-    Auth --> L1
-    REST --> L2
-    REST --> L3
-    REST --> L4
-    L1 --> DDB
+    User -->|1. サインイン| Cognito
+    Cognito -->|2. JWT Token| User
+    User -->|3. API + Token| REST
+    REST --> CogAuth
+    CogAuth -->|4. トークン検証| Cognito
+    CogAuth --> L1
+    CogAuth --> L2
+    CogAuth --> L3
+    CogAuth --> L4
+    L1 --> Cognito
     L2 --> DDB
     L3 --> DDB
     L4 --> DDB
@@ -116,7 +125,8 @@ flowchart TB
     L3 --> CW
     L4 --> CW
     
-    style REST fill:#ff9800
+    style Cognito fill:#ff9800
+    style REST fill:#2196f3
     style L1 fill:#4caf50
     style L2 fill:#4caf50
     style L3 fill:#4caf50
@@ -173,7 +183,7 @@ lambda/
 ```yaml
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Task Management API - Serverless
+Description: Task Management API - Serverless with Cognito Auth
 
 Globals:
   Function:
@@ -185,6 +195,8 @@ Globals:
     Environment:
       Variables:
         TABLE_NAME: !Ref DynamoDBTable
+        COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+        COGNITO_CLIENT_ID: !Ref CognitoUserPoolClient
         LOG_LEVEL: INFO
 
 Parameters:
@@ -195,12 +207,62 @@ Parameters:
       - dev
       - staging
       - prod
-  JwtSecret:
-    Type: String
-    NoEcho: true
-    Description: JWT signing secret
 
 Resources:
+  # ========================================
+  # Amazon Cognito
+  # ========================================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-user-pool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: false
+          Mutable: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-client
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      CallbackURLs:
+        - http://localhost:3000/callback
+      LogoutURLs:
+        - http://localhost:3000/logout
+
   # ========================================
   # API Gateway
   # ========================================
@@ -214,14 +276,11 @@ Resources:
         AllowHeaders: "'Content-Type,Authorization'"
         AllowOrigin: "'*'"
       Auth:
-        DefaultAuthorizer: LambdaAuthorizer
+        DefaultAuthorizer: CognitoAuthorizer
         AddDefaultAuthorizerToCorsPreflight: false
         Authorizers:
-          LambdaAuthorizer:
-            FunctionArn: !GetAtt AuthorizerFunction.Arn
-            Identity:
-              Headers:
-                - Authorization
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
 
   # ========================================
   # DynamoDB
@@ -262,18 +321,7 @@ Resources:
   # Lambda Functions
   # ========================================
   
-  # Authorizer
-  AuthorizerFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub ${AWS::StackName}-authorizer
-      CodeUri: src/
-      Handler: handlers.auth.authorizer_handler
-      Environment:
-        Variables:
-          JWT_SECRET: !Ref JwtSecret
-
-  # Auth Endpoints (Public)
+  # Auth Endpoints (Public - Cognito操作)
   AuthFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -281,22 +329,39 @@ Resources:
       CodeUri: src/
       Handler: handlers.auth.lambda_handler
       Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref DynamoDBTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:SignUp
+                - cognito-idp:ConfirmSignUp
+                - cognito-idp:InitiateAuth
+                - cognito-idp:ForgotPassword
+                - cognito-idp:ConfirmForgotPassword
+                - cognito-idp:GlobalSignOut
+              Resource: !GetAtt CognitoUserPool.Arn
       Events:
-        Register:
+        SignUp:
           Type: Api
           Properties:
             RestApiId: !Ref ApiGateway
-            Path: /auth/register
+            Path: /auth/signup
             Method: POST
             Auth:
               Authorizer: NONE
-        Login:
+        ConfirmSignUp:
           Type: Api
           Properties:
             RestApiId: !Ref ApiGateway
-            Path: /auth/login
+            Path: /auth/signup/confirm
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        SignIn:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /auth/signin
             Method: POST
             Auth:
               Authorizer: NONE
@@ -308,6 +373,12 @@ Resources:
             Method: POST
             Auth:
               Authorizer: NONE
+        SignOut:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /auth/signout
+            Method: POST
 
   # Projects
   ProjectsFunction:
@@ -400,6 +471,15 @@ Outputs:
   DynamoDBTableName:
     Description: DynamoDB Table Name
     Value: !Ref DynamoDBTable
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+  CognitoUserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+  CognitoUserPoolArn:
+    Description: Cognito User Pool ARN
+    Value: !GetAtt CognitoUserPool.Arn
 ```
 
 ### 3. SAMビルド
@@ -441,7 +521,6 @@ sam deploy --guided
 # Stack Name: task-management-api-serverless
 # AWS Region: us-east-1
 # Parameter Environment: dev
-# Parameter JwtSecret: <your-secret-key>
 # Confirm changes before deploy: y
 # Allow SAM CLI IAM role creation: y
 # Save arguments to samconfig.toml: y
@@ -453,24 +532,39 @@ sam deploy
 ### 6. 動作確認
 
 ```bash
-# APIエンドポイント取得
+# 出力情報取得
+STACK_NAME=task-management-api-serverless
+
 API_URL=$(aws cloudformation describe-stacks \
-  --stack-name task-management-api-serverless \
+  --stack-name $STACK_NAME \
   --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
   --output text)
 
-echo $API_URL
+CLIENT_ID=$(aws cloudformation describe-stacks \
+  --stack-name $STACK_NAME \
+  --query 'Stacks[0].Outputs[?OutputKey==`CognitoUserPoolClientId`].OutputValue' \
+  --output text)
 
-# ユーザー登録
-curl -X POST ${API_URL}/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email":"test@example.com","password":"TestPass123","name":"Test User"}'
+echo "API URL: $API_URL"
+echo "Client ID: $CLIENT_ID"
 
-# ログイン
-TOKEN=$(curl -s -X POST ${API_URL}/auth/login \
+# ユーザー登録（Cognito経由）
+curl -X POST ${API_URL}/auth/signup \
   -H "Content-Type: application/json" \
-  -d '{"email":"test@example.com","password":"TestPass123"}' \
-  | jq -r '.data.accessToken')
+  -d '{"email":"test@example.com","password":"TestPass123!","name":"Test User"}'
+
+# メール確認コード入力（実際のメールで受信したコードを使用）
+curl -X POST ${API_URL}/auth/signup/confirm \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","confirmation_code":"123456"}'
+
+# サインイン
+TOKENS=$(curl -s -X POST ${API_URL}/auth/signin \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"TestPass123!"}')
+
+# ID Token を使用（Cognito Authorizerの場合）
+TOKEN=$(echo $TOKENS | jq -r '.data.id_token')
 
 # プロジェクト作成
 curl -X POST ${API_URL}/projects \
@@ -544,21 +638,34 @@ cat src/requirements.txt
 sam build --use-container
 ```
 
-### 3. API Gateway 403 Forbidden
+### 3. API Gateway 401 Unauthorized（Cognito認証エラー）
 
-**原因**: Lambda Authorizerのエラー
+**原因**: Cognitoトークンが無効または期限切れ
 
 **確認方法**:
 ```bash
-# Authorizerのログを確認
-sam logs -n AuthorizerFunction --stack-name task-management-api-serverless --tail
+# トークンのデコード確認（jwt.ioなどで確認）
+# または AWS CLI で確認
+aws cognito-idp get-user --access-token $TOKEN
 ```
 
 **解決方法**:
-- JWTシークレットが正しいか確認
-- トークンの形式が正しいか確認（`Bearer <token>`）
+- ID Token を使用しているか確認（Cognito Authorizer は ID Token を検証）
+- トークンの有効期限を確認
+- User Pool ID と Client ID が正しいか確認
 
-### 4. DynamoDB AccessDeniedException
+### 4. Cognito サインアップエラー: InvalidPasswordException
+
+**原因**: パスワードがポリシーを満たしていない
+
+**解決方法**:
+- 8文字以上
+- 大文字を含む
+- 小文字を含む
+- 数字を含む
+- 特殊文字を含む（設定による）
+
+### 5. DynamoDB AccessDeniedException
 
 **原因**: Lambda関数にDynamoDBへのアクセス権限がない
 
@@ -570,7 +677,7 @@ Policies:
       TableName: !Ref DynamoDBTable
 ```
 
-### 5. コールドスタート遅延
+### 6. コールドスタート遅延
 
 **原因**: Lambda関数の初期化に時間がかかる
 
