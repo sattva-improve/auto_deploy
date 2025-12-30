@@ -40,7 +40,7 @@ servers:
     description: 開発環境
   - url: https://staging-api.example.com/api/v1
     description: ステージング環境
-  - url: https://api.example.com/api/v1
+  - url: http://task-management-api-alb-381160588.us-east-1.elb.amazonaws.com/api/v1
     description: 本番環境
 
 tags:
