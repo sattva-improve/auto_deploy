@@ -187,6 +187,7 @@ flowchart LR
 |-------------|------|------|
 | システム概要 | [../overview.md](../overview.md) | システム全体の概要・構成選択の詳細 |
 | ガイドライン | [../guidelines/index.md](../guidelines/index.md) | 開発ガイドラインインデックス |
+| AI駆動開発 | [./ai-driven-development.md](./ai-driven-development.md) | AI駆動開発ベストプラクティス |
 | ECS CloudFormation | `aws/cloudformation/ecs-fargate.yaml` | ECS Fargate構築テンプレート |
 | Lambda CloudFormation | `aws/cloudformation/api-gateway-lambda.yaml` | API GW + Lambda構築テンプレート |
 | SAMテンプレート | `aws/sam/template.yaml` | SAMによるLambdaデプロイ |
@@ -194,14 +195,24 @@ flowchart LR
 
 ---
 
+## AI駆動開発
+
+AIアシスタントを活用した効率的な開発手法については、以下のガイドを参照してください：
+
+- **[AI駆動開発ベストプラクティスガイド](./ai-driven-development.md)** - GitHub Copilot、Claude Code等のAIツール活用方法
+
+---
+
 ## 変更履歴
 
 | バージョン | 日付 | 変更内容 |
 |-----------|------|----------|
+| 2.1.0 | 2026-01-06 | AI駆動開発ベストプラクティスガイドを追加 |
 | 2.0.0 | 2025-12-30 | Lambda + API Gateway構成を追加、構成選択ガイドを追加 |
 | 1.0.0 | 2025-12-30 | 初版作成 |
 
 ---
 
 **作成日**: 2025-12-30  
+**最終更新日**: 2026-01-06  
 **メンテナー**: auto_deploy プロジェクトチーム

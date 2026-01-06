@@ -194,6 +194,7 @@ gitGraph
 |-------------|------|------|
 | システム概要 | [../overview.md](../overview.md) | システム全体の概要 |
 | ガイドインデックス | [../guides/index.md](../guides/index.md) | 実装・デプロイガイド一覧 |
+| AI駆動開発 | [../guides/ai-driven-development.md](../guides/ai-driven-development.md) | AI駆動開発ベストプラクティス |
 | AIワークフロー | `ai/instructions/workflow.md` | AI指示フロー |
 
 ---

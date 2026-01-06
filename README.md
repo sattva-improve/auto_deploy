@@ -111,6 +111,23 @@ graph LR
 ### OpenAPI仕様書テンプレート
 `specs/openapi/_template.yaml` - OpenAPI 3.1形式の仕様書
 
+## AI駆動開発
+
+本システムは、AIアシスタント（GitHub Copilot、Claude Code等）と連携して効率的に開発を行うことができます。
+
+### AIアシスタント向けファイル
+
+| ファイル | 用途 |
+|---------|------|
+| `COPILOT.md` | GitHub Copilot / AI向け指示書 |
+| `.github/copilot-instructions.md` | GitHub Copilotカスタム指示 |
+| `.mcp.json` | MCP (Model Context Protocol) 設定 |
+| `.claude/commands/` | Claude Codeカスタムコマンド |
+
+### ベストプラクティス
+
+AI駆動開発のベストプラクティスについては、[AI駆動開発ガイド](docs/guides/ai-driven-development.md)を参照してください。
+
 ## 今後の拡張予定
 
 - [ ] 実装コード自動生成

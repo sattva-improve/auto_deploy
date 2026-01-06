@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json.schemastore.org/mcpservers.json",
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/home/nekonisi/auto_deploy"
+      ],
+      "description": "ファイルシステムへのアクセスを提供"
+    },
+    "github": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      },
+      "description": "GitHub APIへのアクセスを提供（イシュー、PR管理）"
+    }
+  }
+}
